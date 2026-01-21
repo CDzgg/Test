@@ -16,9 +16,9 @@ PROXIES = None
 
 # === 3. 新增：老虎证券配置 ===
 # 你的 Tiger ID (在开发者中心查看，通常是一串数字)
-TIGER_ID = "20157087" 
+TIGER_ID = os.getenv('TIGER_ID')
 # 你的账户 ID (在 APP 里能看到，用于交易，查行情其实不是必须的，但填上保险)
-TIGER_ACCOUNT = "8847635" 
+TIGER_ACCOUNT = os.getenv('TIGER_ACCOUNT') 
 # 私钥文件的路径 (确保文件在项目目录下)
 TIGER_PRIVATE_KEY = os.getenv('TIGER_PRIVATE_KEY', "private_key.pem")
 # 运行环境: True=实盘, False=模拟盘 (行情数据通常是一样的)
