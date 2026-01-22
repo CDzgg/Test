@@ -124,15 +124,19 @@ class MarketDataProcessor:
         
         # --- A. 市场状态 (Market State) ---
         current_price = self.quote_data.get('mid_price')
-        # 回退逻辑：如果实时 Quote 缺失，使用 5m Close
+        # 回退逻辑：如果实时 Quote 缺失，使用 5m Close (最新已完成的价格)
         if self._extract_val(current_price) is None and 'intraday' in self.data:
              if not self.data['intraday'].empty:
-                current_price = self.data['intraday'].iloc[-1]['Close']
+                # 【修复】使用倒数第二根（已完成）的收盘价作为回退，避免未完成数据的干扰
+                current_price = self.data['intraday'].iloc[-2]['Close']
 
         # 提取最近 60 个价格点 (Trend Context)
         price_seq = []
         if 'intraday' in self.data:
-            price_seq = self._extract_seq(self.data['intraday']['Close'], length=60)
+            # 【修复】关键修改：剔除最后一行（未完成的 K 线），只取已确认的历史数据
+            # 这样 AI 看到的形态是完全确定的，不会重绘
+            completed_data = self.data['intraday'].iloc[:-1]
+            price_seq = self._extract_seq(completed_data['Close'], length=60)
 
         market_state = {
             "price_current": self._extract_val(current_price),
@@ -144,28 +148,35 @@ class MarketDataProcessor:
         indicators_5m = "Data Insufficient"
         if 'intraday' in self.data and len(self.data['intraday']) > 20:
             df = self.data['intraday']
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
+            # 【修复】关键修改：指针前移
+            # curr = iloc[-2] (上一根，已完成)
+            # prev = iloc[-3] (上上根，已完成)
+            curr = df.iloc[-2]
+            prev = df.iloc[-3]
+            
+            # 为了计算序列特征，我们也只取已完成的部分
+            df_completed = df.iloc[:-1]
             
             indicators_5m = {
                 "close": self._extract_val(curr['Close']),
-                "volume": int(self._extract_val(curr['Volume'], 0)), # Volume取整但走统一提取
+                "volume": int(self._extract_val(curr['Volume'], 0)), 
                 "ema20": self._extract_val(curr.get('EMA20')),
                 # 动能指标
                 "macd_hist": self._extract_val(curr.get('MACD_Hist')),
-                "macd_hist_prev": self._extract_val(prev.get('MACD_Hist')), # 用于判断动能增减
-                "macd_hist_seq_10": self._extract_seq(df['MACD_Hist'], length=10), # 过去10根柱子，看背离
+                "macd_hist_prev": self._extract_val(prev.get('MACD_Hist')), 
+                "macd_hist_seq_10": self._extract_seq(df_completed['MACD_Hist'], length=10),
                 # 震荡指标
                 "rsi7": self._extract_val(curr.get('RSI7')),
                 "rsi14": self._extract_val(curr.get('RSI14')),
-                "rsi7_seq_10": self._extract_seq(df['RSI7'], length=10) # 过去10根RSI，看高位钝化
+                "rsi7_seq_10": self._extract_seq(df_completed['RSI7'], length=10) 
             }
 
         # --- C. 4h 数据 (Macro Context) ---
         indicators_4h = "Data Insufficient"
         if 'longterm' in self.data and len(self.data['longterm']) > 50:
             df = self.data['longterm']
-            curr = df.iloc[-1]
+            # 【修复】同样使用已完成的 K 线
+            curr = df.iloc[-2]
             
             p = self._extract_val(curr['Close'])
             e20 = self._extract_val(curr.get('EMA20'))
@@ -185,6 +196,7 @@ class MarketDataProcessor:
         payload = {
             "symbol": symbol,
             "timestamp": pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "note": "Analysis based on COMPLETED candles only (Lagged by 1 period).",
             "market_state": market_state,
             "indicators": {
                 "intraday_5m": indicators_5m,
