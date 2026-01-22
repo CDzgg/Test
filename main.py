@@ -215,14 +215,43 @@ def _get_private_key_path():
             private_key_path = f.name
     return private_key_path
 
-def _parse_json_response(ai_text):
-    json_patterns = [r'JSON_SUMMARY\s*[:：]\s*({.*?})', r'```json\s*({.*?})\s*```', r'(\{[^{}]*"action"[^{}]*\})']
-    for pattern in json_patterns:
-        json_match = re.search(pattern, ai_text, re.DOTALL)
-        if json_match:
-            try: return json.loads(json_match.group(1))
-            except: pass
-    return {}
+def _parse_json_response(raw_text):
+    """
+    增强型解析器：能够从 AI 的混合文本中提取标准 JSON
+    如果失败，返回明确的 ERROR 状态
+    """
+    try:
+        # 1. 预处理：去除常见的 Markdown 代码块标记
+        text = raw_text.strip()
+        # 移除 ```json 和 ``` 包裹
+        text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^```\s*', '', text, flags=re.MULTILINE)
+        text = text.strip('`')
+
+        # 2. 尝试直接解析
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. 暴力提取：使用正则寻找最外层的 { ... } 结构
+        match = re.search(r'(\{.*\})', text, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+            return json.loads(json_str)
+            
+        # 4. 如果还是失败，抛出主动异常
+        raise ValueError("未找到有效的 JSON 对象")
+
+    except Exception as e:
+        logger.error(f"❌ JSON 解析失败: {e}")
+        # 【关键修改】返回 ERROR 状态，而不是 WAIT
+        return {
+            "action": "ERROR", 
+            "confidence": 0,
+            "reason": f"解析异常: {str(e)}",
+            "raw_snippet": raw_text[:100].replace('\n', ' ') # 截取前100个字符用于排查
+        }
 
 def init_services():
     global tiger_client, tiger_trade_client, deepseek_client, data_manager
@@ -293,14 +322,37 @@ def run_analysis(symbol, silent=False):
             stream=False, temperature=0.2 
         )
         ai_text = response.choices[0].message.content
-        
+ 
         # 4. 结果处理
         parsed_res = _parse_json_response(ai_text)
+        
+        # 【新增】错误拦截与报警
+        if parsed_res.get('action') == 'ERROR':
+            error_msg = f"⚠️ {stock_name} ({symbol}) 系统报警\n"
+            error_msg += f"原因: AI 返回内容无法解析\n"
+            error_msg += f"错误: {parsed_res.get('reason')}\n"
+            error_msg += f"原文片段: {parsed_res.get('raw_snippet')}..."
+            
+            logger.error(error_msg)
+            if not silent:
+                send_telegram(error_msg) # 立即发送报警消息给 Telegram
+            return parsed_res
+
+        # 正常流程
         if not silent:
             report = f"🐯 {stock_name} ({symbol}) 分析报告\n"
-            report += f"操作: {parsed_res.get('action', 'WAIT')}\n信度: {parsed_res.get('confidence', 0)}%\n\n"
-            report += f"详情:\n{ai_text[:1200]}..."
+            report += f"操作: {parsed_res.get('action', 'WAIT')}\n"
+            report += f"信度: {parsed_res.get('confidence', 0)}%\n\n"
+            
+            # 优化：优先使用 AI 返回的 reason，如果太长则截断
+            reason = parsed_res.get('reason', '无理由')
+            report += f"理由: {reason}\n"
+            
+            # 只有在非 ERROR 且非 WAIT 时，或者想看完整报告时才附带原文
+            # report += f"\n详情:\n{ai_text[:500]}..." 
+            
             send_telegram(report)
+            
         return parsed_res
 
     except Exception as e:
