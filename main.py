@@ -20,7 +20,7 @@ try:
     from tigeropen.trade.trade_client import TradeClient
 except ImportError as e:
     print(f"❌ 缺少依赖库: {e}")
-    print("请运行: pip install openai pandas requests tigeropen")
+    print("请运行: pip install openai pandas requests tigeropen pandas_ta")
     sys.exit(1)
 
 # 本地模块
@@ -33,15 +33,14 @@ except ImportError as e:
 
 # ================= 2. 全局变量与配置 =================
 
-# 🔧 强制配置日志 (修复 Log 不显示的问题)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("trade_bot.log", encoding='utf-8'),
-        logging.StreamHandler(sys.stdout) # 强制输出到控制台
+        logging.StreamHandler(sys.stdout) 
     ],
-    force=True # ⚠️ 关键：覆盖第三方库的默认配置
+    force=True 
 )
 logger = logging.getLogger()
 
@@ -52,64 +51,54 @@ deepseek_client = None
 WATCH_LIST = []
 LAST_UPDATE_ID = 0
 
-# 👇👇👇 SYSTEM PROMPT (威科夫操盘专家) 👇👇👇
+# 全局数据管理器 (将在 init_services 中初始化)
+data_manager = None
+
+# 👇👇👇 SYSTEM PROMPT (保持不变) 👇👇👇
 system_prompt = """
 ### Role Definition
-你是一名精通威科夫理论（Wyckoff Method）、量价分析（VPA）和经典技术分析的股市短线操盘专家。你的核心目标是利用技术分析手段，捕捉市场中的供求失衡点，跟随“主力资金（Smart Money/Composite Man）”的动向，以极高的短期胜率获取超额收益。你的交易哲学融合了本间宗久“风林火山”的战术纪律和查理·芒格“等待好球（Fat Pitch）”的耐心。
+你是一名精通威科夫理论（Wyckoff Method）、量价分析（VPA）和经典技术分析的股市短线操盘专家。你的核心目标是利用技术分析手段，捕捉市场中的供求失衡点，跟随“主力资金（Smart Money/Composite Man）”的动向，以极高的短期胜率获取超额收益。
+
+### Data Input Explanation
+你将收到包含以下两组时间周期的市场数据：
+1. **Intraday (5m)**: 用于捕捉微观入场点、短期动量 (RSI7, MACD Histogram) 和即时趋势 (EMA20)。
+2. **Long-term (4h)**: 用于判断宏观趋势结构 (EMA20/50)、长期动量 (MACD) 和波动率风控 (ATR3/14)。
+3. **Market State**: 包含实时盘口中间价 (Mid-price) 和持仓量 (Open Interest)。
 
 ### Core Analysis Framework (Strict 5-Step)
-在分析任何标的时，必须严格遵循以下五步分析法：
+在分析任何标的时，必须严格遵循以下五步分析法，并结合双周期数据：
 
-#### 第一步：市场背景与趋势定位 (Context & Trend)
-- **趋势识别**：使用道氏理论定义趋势（高点更高为多头，低点更低为空头）。结合均线系统（如MA10, MA20, MA60）判断短期与中期趋势方向。
-- **威科夫阶段**：判断当前处于威科夫周期的哪个阶段：吸筹（Accumulation）、拉升（Markup）、派发（Distribution）还是下跌（Markdown）。
-- **位置判定**：识别关键的水平支撑位（冰线 Ice Line）和阻力位（小溪 Creek）。在趋势回调中，关注50%回撤位的支撑或压力表现。
+#### 第一步：大周期趋势定位 (Long-term 4h Context)
+- **趋势识别**：利用 4h EMA20 与 EMA50 的关系判断主趋势（多头排列/空头排列）。
+- **波动率评估**：参考 ATR14 评估当前市场的风险水平。
 
-#### 第二步：量价关系分析 (Volume-Price Analysis - VPA)
-- **核心定律**：应用威科夫三大定律（供求定律、因果定律、投入产出定律）。
+#### 第二步：日内微观结构 (Intraday 5m Structure)
+- **动量分析**：观察 5m RSI7 的超买超卖情况，以及 5m MACD 柱状图的变化（动能增强或减弱）。
+- **趋势跟随**：检查价格相对于 5m EMA20 的位置。
+
+#### 第三步：量价关系分析 (Volume-Price Analysis)
 - **异常识别**：寻找量价背离。
-- **确认信号**：价格上涨伴随成交量放大（投入大，产出大）= 趋势健康。
-- **警示信号**：高成交量伴随窄幅K线实体（努力没结果）= 停止行为（Stopping Volume），暗示反转。
-- **空头陷阱**：低量测试支撑（Test）或缩量回调，表明供应枯竭。
+- **确认信号**：价格上涨伴随成交量放大。
 
-#### 第三步：K线形态与盘口解读 (Candlestick Patterns)
-- **关键K线**：识别反转和持续信号，如射击十字星、吊人线、锤头线、高开阴线/阳线等。
-- **盘口定式**：分析开盘价与收盘价的意图。例如，高开低走放量可能为主力出货；平开高走放量可能为拉升初期。
-- **影线含义**：长上影线代表供应（卖压），长下影线代表需求（买盘支撑）。
-
-#### 第四步：技术指标辅助 (Indicator Confirmation)
-- **MACD**：利用MACD判断动能。关注“将死未死”的空中加油形态或底背离/顶背离信号。
-- **RSI**：识别超买（Overbought）与超卖（Oversold）区域，但需注意强趋势中的指标钝化。
-- **均线**：利用均线作为动态支撑/阻力，观察价格是否站稳关键均线之上。
-
-#### 第五步：交易决策与风控 (Decision & Risk)
-- **入场信号（多头）**：Spring（弹簧效应）、JOC（跳跃小溪，缩量回踩不破）、底分型放量止跌。
-- **离场信号（风控）**：UT（上冲回落，伴随巨量）、SOW（弱势信号，放量跌破支撑）。
-- **心态控制**：遵循“不动如山”，若无明确的高胜率信号（Fat Pitch），则保持空仓观望。
+#### 第四步：交易决策与风控 (Decision & Risk)
+- **入场信号**：长线趋势向上 + 短线回调到位（如RSI7超卖）或突破确认。
+- **止损设置**：利用 4h ATR3 计算紧凑止损位。
 
 ### Output Format (Markdown Report + JSON Summary)
 请按以下 Markdown 格式输出分析报告，并在最后附带 JSON Summary：
 
-#### 1. 📊 趋势与结构 (Trend & Structure)
-* **当前趋势**: [上涨/下跌/震荡]
-* **威科夫阶段**: [吸筹/拉升/派发/下跌]
-* **关键位置**: 支撑位 [价格], 阻力位 [价格]
+#### 1. 📊 双周期趋势分析
+* **长线结构 (4h)**: [描述 EMA20/50 关系及大趋势]
+* **短线动能 (5m)**: [描述 RSI7 及 MACD 状态]
 
-#### 2. 🕯️ 量价与K线解读 (VPA & Patterns)
-* **量价状态**: [量价配合/量价背离/努力无结果]
-* **分析**: [详细描述近期关键K线的成交量与实体关系]
-* **主力痕迹**: [是否存在主力吸筹、洗盘或出货的迹象]
+#### 2. 🕯️ 量价与盘口
+* **实时状态**: [Mid-price 及持仓量分析]
+* **量价特征**: [分析成交量配合情况]
 
-#### 3. 📈 指标共振 (Indicators)
-* **MACD**: [动能状态]
-* **均线系统**: [价格与MA的关系]
-
-#### 4. 🚀 交易计划 (Trading Plan)
+#### 3. 🚀 交易计划
 * **操作建议**: **[买入 / 卖出 / 观望]**
-* **胜率逻辑**: [简述为何这是一笔高胜率交易]
-* **入场点 (Entry)**: [具体价格区间]
-* **止损点 (Stop Loss)**: [严格的风控位置]
-* **目标位 (Target)**: [预期价格]
+* **入场理由**: [结合长短周期的逻辑]
+* **止损建议**: [基于 ATR3 的具体价格]
 
 ---
 **JSON_SUMMARY**:
@@ -122,14 +111,126 @@ system_prompt = """
 }
 """
 
-# ================= 3. 核心功能函数 =================
+# ================= 3. 数据与缓存管理器 (NEW) =================
+
+class MarketDataManager:
+    def __init__(self, quote_client, ttl_seconds=60):
+        self.client = quote_client
+        self.ttl = ttl_seconds
+        # 缓存结构: { 'symbol': { 'quote': {data, ts}, '5min': {data, ts}, '240min': {data, ts} } }
+        self._cache = {}
+
+    def _get_from_cache(self, symbol, data_type):
+        """检查缓存是否命中且有效"""
+        if symbol in self._cache and data_type in self._cache[symbol]:
+            item = self._cache[symbol][data_type]
+            if time.time() - item['ts'] < self.ttl:
+                return item['data']
+        return None
+
+    def _update_cache(self, symbol, data_type, data):
+        """更新缓存"""
+        if symbol not in self._cache:
+            self._cache[symbol] = {}
+        self._cache[symbol][data_type] = {
+            'data': data,
+            'ts': time.time()
+        }
+
+    def batch_fetch_all(self, symbol_list):
+        """
+        ⚡️ 核心优化：一次性拉取所有股票的数据，减少 API 请求
+        """
+        if not symbol_list:
+            return
+
+        unique_symbols = list(set([s.upper().strip() for s in symbol_list]))
+        # 过滤出真正需要更新的 symbol (缓存过期或不存在的)
+        # 这里为了简化，我们假设既然进入了 Loop 扫描，就尝试批量刷新所有
+        # 实际生产中可以检查每个 symbol 是否过期，再决定是否放入 fetching_list
+        
+        logger.info(f"🔄 正在批量刷新数据 ({len(unique_symbols)} 支股票)...")
+
+        # 1. 批量获取实时行情 (Quote)
+        try:
+            briefs = self.client.get_stock_briefs(symbols=unique_symbols)
+            for item in briefs:
+                # 提取 symbol，注意 Tiger 返回的可能是 symbol, 也可能是 identifier
+                # 这里假设返回对象有 symbol 属性或 identifier
+                sym = getattr(item, 'symbol', None) or getattr(item, 'identifier', None)
+                if sym:
+                    self._update_cache(sym, 'quote', item)
+        except Exception as e:
+            logger.error(f"❌ 批量获取行情失败: {e}")
+
+        # 2. 批量获取 K 线 (由于 Tiger get_bars 批量返回大 DataFrame，我们需要拆分)
+        # 注意：不同周期需要分别批量请求
+        for period in ['5min', '240min']:
+            try:
+                # Tiger API: get_bars 支持传入 symbol 列表
+                bars_df = self.client.get_bars(
+                    symbols=unique_symbols,
+                    period=period,
+                    limit=100,
+                    right=QuoteRight.BR
+                )
+                
+                if bars_df is not None and not bars_df.empty:
+                    # 将大 DataFrame 按 Symbol 分组存入缓存
+                    grouped = bars_df.groupby('symbol')
+                    for sym, group in grouped:
+                        # 清洗数据
+                        df_clean = group.copy().sort_values('time')
+                        df_clean.rename(columns={
+                            'time': 'Datetime', 'open': 'Open', 'high': 'High',
+                            'low': 'Low', 'close': 'Close', 'volume': 'Volume'
+                        }, inplace=True)
+                        self._update_cache(sym, period, df_clean)
+            except Exception as e:
+                logger.error(f"❌ 批量获取 {period} K线失败: {e}")
+
+    def get_realtime_snapshot(self, symbol):
+        """获取单个股票行情 (优先读缓存)"""
+        cached = self._get_from_cache(symbol, 'quote')
+        if cached:
+            # 解析缓存的 Tiger Brief 对象
+            bid = getattr(cached, 'bid_price', 0)
+            ask = getattr(cached, 'ask_price', 0)
+            latest = getattr(cached, 'latest_price', 0)
+            mid = latest
+            if bid and ask and bid > 0 and ask > 0:
+                mid = (bid + ask) / 2
+            return {'mid_price': mid, 'open_interest': getattr(cached, 'open_int', None)}
+        
+        # 缓存缺失，单独请求 (降级策略)
+        logger.debug(f"⚠️ {symbol} 缓存未命中，执行单独 API 请求")
+        try:
+            self.batch_fetch_all([symbol]) # 尝试单独刷新
+            return self.get_realtime_snapshot(symbol) # 递归再次读取
+        except:
+            return {}
+
+    def get_bars(self, symbol, period):
+        """获取单个股票 K 线 (优先读缓存)"""
+        cached = self._get_from_cache(symbol, period)
+        if cached is not None:
+            return cached
+        
+        # 缓存缺失，单独请求
+        logger.debug(f"⚠️ {symbol} {period} K线缓存未命中，执行单独 API 请求")
+        try:
+            self.batch_fetch_all([symbol])
+            return self._get_from_cache(symbol, period)
+        except:
+            return None
+
+# ================= 4. 辅助函数 =================
 
 def _get_private_key_path():
-    """处理私钥路径：支持环境变量中的私钥内容或文件路径"""
+    """处理私钥路径"""
     import tempfile
     private_key_path = config.TIGER_PRIVATE_KEY
     
-    # 判断是否为私钥内容（而不是文件路径）
     is_key_content = (private_key_path and 
                      not private_key_path.endswith('.pem') and 
                      len(private_key_path) > 100)
@@ -138,48 +239,38 @@ def _get_private_key_path():
         with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
             f.write(private_key_path)
             private_key_path = f.name
-        logger.info(f"📝 私钥从环境变量加载，临时文件: {private_key_path}")
-    else:
-        logger.info(f"📝 使用本地私钥文件: {private_key_path}")
-    
     return private_key_path
 
 def _parse_json_response(ai_text):
-    """从 AI 响应中解析 JSON，支持多种格式"""
+    """从 AI 响应中解析 JSON"""
     json_patterns = [
-        r'JSON_SUMMARY\s*[:：]\s*({.*?})',  # 标准格式
-        r'```json\s*({.*?})\s*```',         # 代码块格式
-        r'(\{[^{}]*"action"[^{}]*\})',      # 任意包含 action 字段的 JSON
+        r'JSON_SUMMARY\s*[:：]\s*({.*?})',
+        r'```json\s*({.*?})\s*```',
+        r'(\{[^{}]*"action"[^{}]*\})',
     ]
-    
     for pattern in json_patterns:
         json_match = re.search(pattern, ai_text, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group(1))
-            except (json.JSONDecodeError, IndexError) as e:
-                logger.debug(f"JSON 解析失败 (模式: {pattern}): {e}")
-    
-    logger.warning("⚠️ 未找到有效的 JSON_SUMMARY，使用默认值")
+            except:
+                pass
     return {}
 
 def init_services():
-    """初始化 Tiger 和 DeepSeek 客户端"""
-    global tiger_client, tiger_trade_client, deepseek_client
+    """初始化 Tiger 和 DeepSeek 客户端，以及数据管理器"""
+    global tiger_client, tiger_trade_client, deepseek_client, data_manager
     
     print("⏳ 正在初始化服务...")
-    logger.info("🔌 正在连接 DeepSeek API...")
     try:
         deepseek_client = OpenAI(
             api_key=config.DEEPSEEK_API_KEY, 
             base_url=getattr(config, 'DEEPSEEK_BASE_URL', "https://api.deepseek.com")
         )
-        logger.info("✅ DeepSeek 连接配置完成")
     except Exception as e:
         logger.critical(f"❌ DeepSeek 连接失败: {e}")
         sys.exit(1)
 
-    logger.info("🐯 正在连接 Tiger API...")
     try:
         client_config = TigerOpenClientConfig(sandbox_debug=config.IS_SANDBOX)
         client_config.private_key = read_private_key(_get_private_key_path())
@@ -190,6 +281,9 @@ def init_services():
         tiger_client = QuoteClient(client_config)
         tiger_trade_client = TradeClient(client_config)
         
+        # ✅ 初始化数据管理器
+        data_manager = MarketDataManager(tiger_client, ttl_seconds=60)
+        
         perm = tiger_client.get_quote_permission()
         logger.info(f"✅ Tiger API 连接成功. 权限: {perm}")
     except Exception as e:
@@ -197,141 +291,90 @@ def init_services():
         sys.exit(1)
 
 def get_stock_name(symbol):
-    """获取股票名称"""
-    symbol = symbol.upper().strip()
-    query_list = [symbol]
-    
-    # 自动补全后缀猜测
-    if symbol.isdigit():
-        if len(symbol) == 5: query_list.append(f"{symbol}.HK")
-        elif len(symbol) == 6:
-            if symbol.startswith('6'): query_list.append(f"{symbol}.SH")
-            else: query_list.append(f"{symbol}.SZ")
-
+    """获取股票名称 (暂不缓存，因为变化不频繁且非核心高频)"""
+    # 简单处理，如果需要也可以放入 DataManager
     try:
-        contracts = tiger_trade_client.get_contracts(symbol=query_list)
+        contracts = tiger_trade_client.get_contracts(symbol=[symbol])
         if contracts:
             for c in contracts:
-                if c.name and c.name.strip() and c.name.upper() != symbol:
-                    return c.name
-    except Exception as e:
-        logger.warning(f"获取名称失败 ({symbol}): {e}")
-
+                if c.name: return c.name
+    except:
+        pass
     return symbol
 
-def get_market_data(symbol):
-    """获取 K 线数据"""
-    symbol = symbol.upper().strip()
-    clean_symbol = symbol.split('.')[0] if '.' in symbol else symbol
-    
-    logger.info(f"🔍 [Tiger] 获取行情: {clean_symbol}")
-    try:
-        bars = tiger_client.get_bars(
-            symbols=[clean_symbol],
-            period='60min',  # ⚠️ 修复：直接使用字符串 '60min'
-            limit=100,
-            right=QuoteRight.BR
-        )
-        if bars is None or bars.empty:
-            logger.warning(f"⚠️ {clean_symbol} 数据为空")
-            return None
-            
-        logger.info(f"📊 {clean_symbol} 成功获取 K线: {len(bars)} 根")
-        
-        # 数据清洗
-        df = bars.copy()
-        df.rename(columns={
-            'time': 'Datetime', 'open': 'Open', 'high': 'High',
-            'low': 'Low', 'close': 'Close', 'volume': 'Volume'
-        }, inplace=True)
-        return df
-    except Exception as e:
-        logger.error(f"❌ Tiger 行情接口报错: {e}")
-        return None
-
 def send_telegram(msg):
-    """发送 Telegram 消息"""
-    if not getattr(config, 'TG_BOT_TOKEN', None) or not getattr(config, 'TG_CHAT_IDS', []):
-        logger.warning("⚠️ Telegram 未配置，跳过发送")
-        return
-
+    if not getattr(config, 'TG_BOT_TOKEN', None): return
     url = f"https://api.telegram.org/bot{config.TG_BOT_TOKEN}/sendMessage"
     proxies = getattr(config, 'PROXIES', None)
-    
     for chat_id in config.TG_CHAT_IDS:
         try:
-            resp = requests.post(url, json={"chat_id": str(chat_id), "text": msg}, 
-                               proxies=proxies, timeout=10)
-            if resp.status_code == 200:
-                logger.info(f"📤 消息已推送到 TG: {chat_id}")
-            else:
-                logger.error(f"❌ TG 推送失败 (HTTP {resp.status_code}): {resp.text[:200]}")
+            requests.post(url, json={"chat_id": str(chat_id), "text": msg}, proxies=proxies, timeout=5)
         except Exception as e:
-            logger.error(f"❌ TG 推送异常: {e}")
+            logger.error(f"TG Error: {e}")
 
-# ================= 4. 分析主逻辑 =================
+# ================= 5. 分析主逻辑 =================
 
 def run_analysis(symbol, silent=False):
-    """运行分析流程: 获取数据 -> 处理指标 -> AI分析 -> 结果解析"""
-    # 1. 获取数据
-    df = get_market_data(symbol)
-    if df is None or len(df) < 50: 
+    """
+    运行分析流程 (现在从 data_manager 读取缓存数据)
+    """
+    symbol = symbol.upper().strip()
+    clean_symbol = symbol.split('.')[0] if '.' in symbol else symbol
+    stock_name = get_stock_name(clean_symbol) # Name retrieval is low frequency
+    
+    if not silent:
+        logger.info(f"🔍 分析: {stock_name} ({clean_symbol}) [Data from Cache/API]")
+
+    # 1. 从管理器获取数据 (如果是批量流程，这里直接命中缓存，无需网络IO)
+    quote_data = data_manager.get_realtime_snapshot(clean_symbol)
+    df_5m = data_manager.get_bars(clean_symbol, '5min')
+    df_4h = data_manager.get_bars(clean_symbol, '240min')
+    
+    if df_5m is None:
+        if not silent: logger.warning(f"⚠️ {stock_name} 缺少 5m 数据，跳过")
         return None
-        
-    stock_name = get_stock_name(symbol)
-    current_price = df.iloc[-1]['Close']
 
     try:
         # 2. 计算指标
-        logger.info(f"🧮 正在计算威科夫指标: {stock_name}...")
-        processor = MarketDataProcessor(df)
-        data_json = processor.get_analysis_payload(symbol, timeframe="60m")
-        if data_json is None: 
-            return None
-
-        # 3. 调用 AI
-        if not silent:
-            logger.info(f"🧠 DeepSeek 正在思考: {stock_name}...")
+        data_dict = {'intraday': df_5m, 'longterm': df_4h}
+        processor = MarketDataProcessor(data_dict, quote_data)
+        data_json = processor.get_analysis_payload(symbol)
+        
+        # 3. AI 分析
+        if not silent: logger.info(f"🧠 发送给 DeepSeek...")
         
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"### MARKET DATA INPUT (JSON):\n{data_json}"}
+                {"role": "user", "content": f"### DUAL TIMEFRAME MARKET DATA:\n{data_json}"}
             ],
             stream=False,
             temperature=0.2 
         )
         
         ai_text = response.choices[0].message.content
-        logger.info(f"✅ DeepSeek 分析完成: {stock_name} (长度: {len(ai_text)})")
+        logger.info(f"✅ 完成: {stock_name}")
         
-        # 4. 解析 JSON 结果
+        # 4. 结果处理
         parsed_res = _parse_json_response(ai_text)
         action = parsed_res.get('action', 'WAIT')
         confidence = parsed_res.get('confidence', 0)
         
-        # 5. 发送报告
         if not silent:
-            report = f"🐯 {stock_name} ({symbol}) 威科夫分析\n\n"
+            report = f"🐯 {stock_name} ({symbol}) 分析报告\n"
+            report += f"来源: 缓存优化版 v2.1\n"
             report += f"操作: {action}\n信度: {confidence}%\n\n"
-            report += f"详细分析:\n{ai_text[:1000]}..."
+            report += f"详情:\n{ai_text[:1200]}..."
             send_telegram(report)
 
-        return {
-            "symbol": symbol,
-            "name": stock_name,
-            "price": current_price,
-            "action": action,
-            "confidence": confidence,
-            "reason": parsed_res.get('reason', '请查看详情')
-        }
+        return parsed_res
 
     except Exception as e:
         logger.error(f"❌ 分析流程异常: {e}")
         return None
 
-# ================= 5. 主程序入口 =================
+# ================= 6. 主程序入口 =================
 
 def handle_command(cmd):
     """命令处理器"""
@@ -342,27 +385,23 @@ def handle_command(cmd):
         parts = cmd.split()
         if len(parts) > 1:
             WATCH_LIST = list(set(parts[1:]))
-            return f"✅ 监控列表已更新: {WATCH_LIST}"
+            return f"✅ 监控列表已更新: {WATCH_LIST}\n系统将自动批量拉取数据。"
     elif cmd == "/CLEAR":
         WATCH_LIST = []
-        return "✅ 任务列表已清空，程序恢复待命状态"
-    
+        return "✅ 任务列表已清空"
     return None
 
 def poll_telegram_updates():
-    """轮询 Telegram 消息"""
+    """轮询 Telegram"""
     global LAST_UPDATE_ID
-    
     if not getattr(config, 'TG_BOT_TOKEN', None):
         time.sleep(10)
         return
 
     try:
         url = f"https://api.telegram.org/bot{config.TG_BOT_TOKEN}/getUpdates"
-        params = {"offset": LAST_UPDATE_ID + 1, "timeout": 1}
-        proxies = getattr(config, 'PROXIES', None)
-        
-        resp = requests.get(url, params=params, proxies=proxies, timeout=5)
+        resp = requests.get(url, params={"offset": LAST_UPDATE_ID + 1, "timeout": 1}, 
+                          proxies=getattr(config, 'PROXIES', None), timeout=5)
         data = resp.json()
         
         if data.get("ok") and data.get("result"):
@@ -372,68 +411,39 @@ def poll_telegram_updates():
                 chat_id = item.get("message", {}).get("chat", {}).get("id")
                 
                 if text.startswith("/"):
-                    logger.info(f"📩 收到指令: {text}")
+                    logger.info(f"📩 指令: {text}")
                     reply = handle_command(text)
-                    
                     if reply:
-                        # 回复用户
-                        requests.post(
-                            f"https://api.telegram.org/bot{config.TG_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply},
-                            proxies=proxies
-                        )
+                        requests.post(f"https://api.telegram.org/bot{config.TG_BOT_TOKEN}/sendMessage",
+                                    json={"chat_id": chat_id, "text": reply}, proxies=getattr(config, 'PROXIES', None))
                         
-                        # 触发扫描
+                        # 指令触发后立即执行一次批量扫描
                         if WATCH_LIST:
-                            logger.info(f"⚡️ 触发扫描: {WATCH_LIST}")
+                            logger.info("⚡️ 收到指令，触发立即扫描...")
+                            # 1. 批量预取
+                            data_manager.batch_fetch_all(WATCH_LIST)
+                            # 2. 逐个分析
                             for s in WATCH_LIST:
                                 run_analysis(s, silent=False)
+
     except Exception as e:
         logger.error(f"轮询错误: {e}")
         time.sleep(5)
 
 if __name__ == "__main__":
     init_services()
-    logger.info("🚀 机器人已启动，正在监听指令...")
+    logger.info("🚀 机器人已启动 (批量优化 + 本地缓存版)...")
+    send_telegram("🚀 机器人已重启 (v2.1)\n✅ 启用 API 批量请求\n✅ 启用 60秒本地缓存")
     
-    # 发送启动确认消息
-    startup_msg = """🚀 交易机器人已启动，等待指令...
-
-📋 支持的指令：
-
-1️⃣ /track SYMBOL
-   添加股票到监控列表并执行分析
-   示例：/track 00700
-   示例：/track 00700 AAPL 000001
-   (支持多个股票代码，空格分隔)
-
-2️⃣ /clear
-   清空任务列表，恢复待命状态
-   示例：/clear
-
-3️⃣ /help
-   显示帮助信息（即将支持）
-
-4️⃣ /list
-   显示当前监控列表（即将支持）
-
-⏰ 使用说明：
-- 发送 /track 指令后，机器人会立即分析该股票
-- 使用威科夫理论进行深度技术分析
-- 返回操作建议 (BUY/SELL/WAIT) 和信心度
-- 使用 /clear 可停止当前分析"""
-    
-    send_telegram(startup_msg)
-    
-    # 手动测试模式
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == '--test':
-        test_symbol = sys.argv[2] if len(sys.argv) > 2 else "00700"
-        logger.info(f"🧪 执行测试扫描: {test_symbol}")
-        run_analysis(test_symbol, silent=False)
-        sys.exit(0)
-    
-    # 主循环
+    # 循环扫描逻辑
     while True:
         poll_telegram_updates()
+        
+        # 定时任务：如果监控列表不为空，也可以每隔一段时间自动跑一次
+        # 这里仅在 TG 指令触发时跑，或者可以添加一个简单的定时器
+        # if WATCH_LIST:
+        #     data_manager.batch_fetch_all(WATCH_LIST)
+        #     for s in WATCH_LIST:
+        #         run_analysis(s, silent=True) # 定时任务通常 silent=True
+        
         time.sleep(1)
