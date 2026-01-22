@@ -344,6 +344,38 @@ def poll_telegram_updates():
 
 if __name__ == "__main__":
     init_services()
-    logger.info("🚀 机器人启动 (v3.0 语义增强版)")
-    send_telegram("🚀 机器人已重启: 双周期 + 语义增强 + 数据清洗")
-    while True: poll_telegram_updates(); time.sleep(1)
+    logger.info("🚀 机器人启动 (v3.1 自动调度修复版)")
+    send_telegram("🚀 机器人已重启: 自动调度已启用")
+    
+    # 初始化计时器
+    last_scan_time = time.time()
+    
+    while True:
+        try:
+            # 1. 响应 Telegram 指令 (保持原有的 /track 立即触发功能)
+            # poll_telegram_updates 内部已经包含了: 收到指令 -> 更新列表 -> 立即扫描 的逻辑
+            poll_telegram_updates()
+            
+            # 2. 执行定时扫描逻辑
+            current_time = time.time()
+            # 检查是否达到扫描间隔 (config.SCAN_INTERVAL) 且监控列表不为空
+            if (current_time - last_scan_time > config.SCAN_INTERVAL) and WATCH_LIST:
+                logger.info(f"⏰ 触发定时扫描 (间隔: {config.SCAN_INTERVAL}s)")
+                
+                # 批量刷新数据缓存 (这一步至关重要，确保数据不是旧的)
+                data_manager.batch_fetch_all(WATCH_LIST)
+                
+                # 逐个分析
+                for symbol in WATCH_LIST:
+                    run_analysis(symbol, silent=False)
+                
+                # 重置计时器
+                last_scan_time = current_time
+                
+        except Exception as e:
+            logger.error(f"❌ 主循环发生异常: {e}")
+            # 防止死循环报错导致 CPU 飙升，异常后稍作等待
+            time.sleep(5)
+            
+        # 短暂休眠，避免死循环占用过多 CPU 资源
+        time.sleep(1)
