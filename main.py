@@ -84,6 +84,11 @@ system_prompt = """
 #### 第四步：交易决策与风控 (Decision & Risk)
 - **入场信号**：长线趋势向上 + 短线回调到位（如RSI7超卖）或突破确认。
 - **止损设置**：利用 4h ATR3 计算紧凑止损位。
+- **资金管理 (Money Management)**: 
+   - 你将收到当前的账户资金 (Cash) 和持仓 (Position)。
+   - **加仓逻辑**: 如果已有持仓且趋势确认加强 (Confirmation)，可以继续买入，但单支股票持仓不能超过50%，账户总持仓股票数量不超过10个。
+   - **金额决定**: 请根据你的【置信度 (Confidence)】和【账户余额】决定本次交易的金额。
+   - 建议：高信度 (>80%) 可投入较大仓位，低信度轻仓试错。切勿建议超过可用现金的金额。
 
 ### Output Format (Markdown Report + JSON Summary)
 请按以下 Markdown 格式输出分析报告，并在最后附带 JSON Summary：
@@ -108,6 +113,7 @@ system_prompt = """
   "confidence": 0-100,
   "entry": float,
   "stop_loss": float,
+  "target_cash": float,  // 【新增】本次计划投入的现金金额 (单位: 账户本位币，如 HKD)。如果是 SELL，填 0 表示全卖，或填具体金额减仓。
   "reason": "简短的中文理由"
 }
 """
@@ -311,16 +317,31 @@ def run_analysis(symbol, silent=False):
         processor = MarketDataProcessor(data_dict, quote_data)
         data_json = processor.get_analysis_payload(symbol)
         
+        # ================= 插入账户上下文 (新增) =================
+        curr_cash, curr_currency = get_account_status()
+        curr_pos = get_position(clean_symbol)
+        
+        account_context = f"""
+### 当前账户状态 (Fund Management Context):
+- 可用资金: {curr_cash} {curr_currency}
+- 当前持仓 ({symbol}): {curr_pos} 股
+- 说明：请根据当前流动性确定“target_cash”。请勿超过可用现金。
+"""
+        # =======================================================
+
         # 3. AI 分析
-        if not silent: logger.info(f"🧠 发送给 DeepSeek...")
+        if not silent: logger.info(f"🧠 发送给 DeepSeek (含资金信息)...")
+        # 组合最终的 Prompt
+        final_user_content = f"### DUAL TIMEFRAME MARKET DATA:\n{data_json}\n{account_context}"
+        
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"### DUAL TIMEFRAME MARKET DATA:\n{data_json}"}
+                {"role": "user", "content": final_user_content}
             ],
             stream=False, temperature=0.2 
-        )
+            )
         ai_text = response.choices[0].message.content
  
         # 4. 结果处理
@@ -338,26 +359,114 @@ def run_analysis(symbol, silent=False):
                 send_telegram(error_msg) # 立即发送报警消息给 Telegram
             return parsed_res
 
-        # 正常流程
+# ================= 交易执行 (修改调用参数) =================
+        trade_feedback = ""
+        action = parsed_res.get('action', 'WAIT')
+        confidence = parsed_res.get('confidence', 0)
+        target_cash = parsed_res.get('target_cash', 0.0)  # 获取 AI 建议金额
+        
+        # 只有在信号明确且置信度高时才交易
+        if action in ["BUY", "SELL"] and confidence >= 70:
+            logger.info(f"⚡ 触发交易: {action} (AI建议金额: {target_cash})")
+            # 调用 execute_order 执行交易
+            trade_feedback = execute_order(symbol, action, confidence, target_cash)
+        # =======================================================
+
+        # --- C. 发送报告 (包含交易反馈) ---
         if not silent:
             report = f"🐯 {stock_name} ({symbol}) 分析报告\n"
-            report += f"操作: {parsed_res.get('action', 'WAIT')}\n"
-            report += f"信度: {parsed_res.get('confidence', 0)}%\n\n"
+            report += f"决策: {action} (信度: {confidence}%)\n"
+            report += f"建议金额: {target_cash}\n"
+            report += f"理由: {parsed_res.get('reason', 'N/A')}\n"
             
-            # 优化：优先使用 AI 返回的 reason，如果太长则截断
-            reason = parsed_res.get('reason', '无理由')
-            report += f"理由: {reason}\n"
-            
-            # 只有在非 ERROR 且非 WAIT 时，或者想看完整报告时才附带原文
-            # report += f"\n详情:\n{ai_text[:500]}..." 
+            # 如果发生了交易，把结果附在报告里
+            if trade_feedback:
+                report += f"----------------\n⚙️ 执行: {trade_feedback}\n"
             
             send_telegram(report)
             
         return parsed_res
 
+
+
     except Exception as e:
         logger.error(f"❌ 流程异常: {e}")
         return None
+
+# ================= execute_order 下单函数 ================= 
+
+def execute_order(symbol, action_str, confidence, target_cash):
+    """
+    执行下单 - DeepSeek 托管模式
+    target_cash: AI 建议的交易金额 (由 JSON 返回)
+    """
+    if not getattr(config, 'ENABLE_TRADING', False):
+        return f"模拟交易: 开关关闭 (AI建议: {action_str} {target_cash})"
+
+    try:
+        # 1. 基础信息
+        symbol = symbol.upper()
+        curr_pos = get_position(symbol)
+        
+        # 获取实时价格
+        quote = data_manager.get_realtime_snapshot(symbol)
+        price = quote.get('mid_price', 0)
+        if price <= 0: return "❌ 价格获取失败，取消"
+
+        quantity = 0
+        
+        # ================= BUY 逻辑 (支持加仓) =================
+        if action_str == "BUY":
+            # 【逻辑修改】不再拦截 curr_pos > 0，允许加仓
+            # 资金风控：再次核对账户余额 (防止 AI 幻觉建议了超额资金)
+            avail_cash, _ = get_account_status()
+            
+            # 使用 AI 建议的金额，但不能超过实际可用资金
+            safe_cash = min(float(target_cash), float(avail_cash))
+            
+            if safe_cash < price: # 连一股都买不起
+                return f"❌ 资金不足或AI建议金额过小 (建议: {target_cash}, 股价: {price})"
+
+            # 计算股数 (向下取整)
+            quantity = int(safe_cash / price)
+            
+            # 港股/A股 手数调整 (可选优化: 确保是 100 的倍数)
+            # if symbol.isdigit(): quantity = (quantity // 100) * 100 
+            
+            if quantity == 0: return "❌ 计算股数为 0"
+
+        # ================= SELL 逻辑 =================
+        elif action_str == "SELL":
+            if curr_pos <= 0: return "⚠️ 无持仓，无法卖出"
+            
+            # 如果 AI 建议卖出金额为 0 或 负数，默认视为【清仓】
+            if target_cash <= 0 or target_cash >= (curr_pos * price):
+                quantity = curr_pos
+                note = "清仓"
+            else:
+                # 减仓逻辑
+                quantity = int(target_cash / price)
+                if quantity > curr_pos: quantity = curr_pos
+                note = f"减仓 (保留 {curr_pos - quantity}股)"
+
+        # 3. 下单执行
+        contract = tiger_trade_client.get_contracts(symbol=symbol)[0]
+        action = ActionType.BUY if action_str == "BUY" else ActionType.SELL
+        
+        order = Order(
+            account=config.TIGER_ACCOUNT,
+            contract=contract,
+            action=action,
+            order_type=OrderType.MKT,
+            quantity=quantity
+        )
+        
+        oid = tiger_trade_client.place_order(order)
+        return f"✅ 下单成功: {action_str} {quantity}股 ({note if action_str == 'SELL' else '加仓' if curr_pos > 0 else '建仓'})"
+
+    except Exception as e:
+        logger.error(f"❌ 下单异常: {e}")
+        return f"执行失败: {str(e)}"
 
 # ================= 6. 入口 =================
 
