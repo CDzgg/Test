@@ -27,3 +27,7 @@ IS_SANDBOX = False
 # === 4. 策略参数 ===
 DEFAULT_INTERVAL = "15m"  # K线周期
 SCAN_INTERVAL = 300       # 自动轮询间隔 (秒)
+
+# === 5. 交易开关 ===
+# False=模拟交易模式 (仅输出建议), True=实际下单 (谨慎启用！)
+ENABLE_TRADING = os.getenv('ENABLE_TRADING', 'False').lower() in ('true', '1', 'yes')

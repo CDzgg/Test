@@ -2,6 +2,9 @@ import pandas as pd
 import pandas_ta as ta
 import json
 import numpy as np
+import logging
+
+logger = logging.getLogger()
 
 class MarketDataProcessor:
     def __init__(self, data_dict, quote_data=None):
@@ -14,11 +17,15 @@ class MarketDataProcessor:
         # 数据加载与预处理
         if 'intraday' in data_dict and data_dict['intraday'] is not None:
             self.data['intraday'] = data_dict['intraday'].copy()
+            logger.debug(f"   [5m] 加载 {len(self.data['intraday'])} 根 K线，开始计算指标...")
             self._process_intraday_indicators(self.data['intraday'])
+            logger.debug(f"   [5m] 指标计算完成")
             
         if 'longterm' in data_dict and data_dict['longterm'] is not None:
             self.data['longterm'] = data_dict['longterm'].copy()
+            logger.debug(f"   [4h] 加载 {len(self.data['longterm'])} 根 K线，开始计算指标...")
             self._process_longterm_indicators(self.data['longterm'])
+            logger.debug(f"   [4h] 指标计算完成")
 
     # ================= 1. 数据标准化核心 (Standardization Layer) =================
     

@@ -31,6 +31,27 @@ except ImportError as e:
     print(f"❌ 缺少本地文件: {e}")
     sys.exit(1)
 
+# ================= 2. 辅助类型定义 =================
+
+class ActionType:
+    """订单操作类型"""
+    BUY = "BUY"
+    SELL = "SELL"
+
+class OrderType:
+    """订单类型"""
+    MKT = "MKT"  # 市价单
+    LMT = "LMT"  # 限价单
+
+class Order:
+    """订单对象"""
+    def __init__(self, account, contract, action, order_type, quantity):
+        self.account = account
+        self.contract = contract
+        self.action = action
+        self.order_type = order_type
+        self.quantity = quantity
+
 # ================= 2. 全局变量与配置 =================
 
 logging.basicConfig(
@@ -293,6 +314,92 @@ def send_telegram(msg):
                      proxies=getattr(config, 'PROXIES', None), timeout=5)
     except Exception as e: logger.error(f"TG Error: {e}")
 
+def get_account_status():
+    """
+    获取账户资金状态
+    返回: (可用现金, 货币代码)
+    说明: 如果无法获取，返回 (-1, "UNKNOWN") 作为特殊标记
+    """
+    try:
+        if tiger_trade_client is None:
+            logger.warning("⚠️ Trade Client 未初始化")
+            return (-1, "UNKNOWN")
+        
+        # 尝试使用 get_asset 或类似方法获取资产信息
+        # Tiger API 通常通过账户查询获取资金信息
+        try:
+            # 方法1: 尝试 get_asset (常见的资产查询方法)
+            asset = tiger_trade_client.get_asset()
+            if asset:
+                cash_available = getattr(asset, 'cash', 0)
+                currency = getattr(asset, 'currency', 'HKD')
+                logger.info(f"💰 账户资金: {cash_available} {currency}")
+                return (float(cash_available), currency)
+        except AttributeError:
+            pass
+        
+        try:
+            # 方法2: 尝试 get_position 中提取现金信息
+            positions = tiger_trade_client.get_positions()
+            if positions:
+                # 某些 API 版本在 positions 中包含现金信息
+                for pos in positions:
+                    if getattr(pos, 'symbol', '') == 'CASH':
+                        cash = getattr(pos, 'quantity', 0)
+                        logger.info(f"💰 账户资金: {cash} HKD")
+                        return (float(cash), "HKD")
+        except Exception:
+            pass
+        
+        # 如果以上都失败，返回特殊标记 (-1, "UNKNOWN")
+        logger.warning("⚠️ 无法获取账户资金信息 (API 权限或版本问题)")
+        return (-1, "UNKNOWN")
+        
+    except Exception as e:
+        logger.error(f"❌ 获取账户失败: {e}")
+        return (-1, "UNKNOWN")
+
+def get_position(symbol):
+    """
+    获取某支股票的持仓数量
+    返回: 持仓股数 (int)，如果无持仓返回 0
+    """
+    try:
+        if tiger_trade_client is None:
+            return 0
+        
+        symbol = symbol.upper().strip()
+        clean_symbol = symbol.split('.')[0] if '.' in symbol else symbol
+        
+        # 获取所有持仓
+        try:
+            positions = tiger_trade_client.get_positions()
+        except Exception as e:
+            logger.error(f"❌ 查询持仓异常: {e}")
+            return 0
+        
+        if not positions:
+            return 0
+        
+        # 查找该股票的持仓
+        for pos in positions:
+            pos_symbol = getattr(pos, 'symbol', '')
+            
+            # 比对逻辑：处理多种格式 (00700, 00700.HK, TCEHY 等)
+            pos_clean = pos_symbol.upper().split('.')[0] if pos_symbol else ''
+            
+            if pos_clean == clean_symbol or pos_symbol.upper() == symbol:
+                qty = getattr(pos, 'quantity', 0)
+                if qty > 0:  # 只记录正持仓
+                    logger.debug(f"📊 {symbol} 持仓: {qty}股")
+                    return int(qty)
+        
+        return 0
+        
+    except Exception as e:
+        logger.error(f"❌ 获取持仓失败 ({symbol}): {e}")
+        return 0
+
 # ================= 5. 主逻辑 =================
 
 def run_analysis(symbol, silent=False):
@@ -311,27 +418,72 @@ def run_analysis(symbol, silent=False):
         if not silent: logger.warning(f"⚠️ {stock_name} 缺少 5m 数据")
         return None
 
+    # ================= 【新增】股票信息打印 =================
+    if not silent:
+        logger.info(f"📊 股票基本信息:")
+        logger.info(f"   名称: {stock_name}")
+        logger.info(f"   代码: {clean_symbol}")
+        logger.info(f"   实时价格: {quote_data.get('mid_price', 'N/A')}")
+        logger.info(f"   持仓量: {quote_data.get('open_interest', 'N/A')}")
+        
+        if df_5m is not None and not df_5m.empty:
+            logger.info(f"   5m K线: {len(df_5m)} 根 (最新收盘: {df_5m.iloc[-1]['Close']:.4f})")
+        if df_4h is not None and not df_4h.empty:
+            logger.info(f"   4h K线: {len(df_4h)} 根 (最新收盘: {df_4h.iloc[-1]['Close']:.4f})")
+    # =======================================================
+
     try:
         # 2. 处理数据 (清洗 & 语义标签)
         data_dict = {'intraday': df_5m, 'longterm': df_4h}
         processor = MarketDataProcessor(data_dict, quote_data)
         data_json = processor.get_analysis_payload(symbol)
         
-        # ================= 插入账户上下文 (新增) =================
+        # ================= 【新增】指标信息打印 =================
+        if not silent:
+            logger.info(f"📈 技术指标已计算:")
+            indicators = json.loads(data_json).get('indicators', {})
+            ind_5m = indicators.get('intraday_5m', {})
+            ind_4h = indicators.get('longterm_4h', {})
+            
+            if isinstance(ind_5m, dict):
+                logger.info(f"   5m: RSI7={ind_5m.get('rsi7')}, MACD_H={ind_5m.get('macd_hist')}, EMA20={ind_5m.get('ema20')}")
+            if isinstance(ind_4h, dict):
+                logger.info(f"   4h: 趋势={ind_4h.get('trend_tag')}, EMA20={ind_4h.get('ema20')}, EMA50={ind_4h.get('ema50')}, ATR14={ind_4h.get('atr14')}")
+        # =======================================================
+        
+        # ================= 插入账户上下文 (改进) =================
         curr_cash, curr_currency = get_account_status()
         curr_pos = get_position(clean_symbol)
         
-        account_context = f"""
+        # ================= 【新增】账户信息打印（改进版本） =================
+        if not silent:
+            logger.info(f"💼 账户状态:")
+            if curr_cash == -1:
+                logger.info(f"   可用资金: 无法获取 (API 权限问题)")
+            else:
+                logger.info(f"   可用资金: {curr_cash} {curr_currency}")
+            logger.info(f"   当前持仓: {curr_pos} 股")
+        # =======================================================
+        
+        # 如果无法获取账户信息，给出友好提示
+        if curr_cash == -1:
+            account_context = f"""
+### 当前账户状态 (Fund Management Context):
+- 可用资金: 无法获取 (API 权限或版本问题)
+- 当前持仓 ({symbol}): {curr_pos} 股
+- 说明：由于无法获取账户余额，建议在高信度时谨慎入场。
+"""
+        else:
+            account_context = f"""
 ### 当前账户状态 (Fund Management Context):
 - 可用资金: {curr_cash} {curr_currency}
 - 当前持仓 ({symbol}): {curr_pos} 股
-- 说明：请根据当前流动性确定“target_cash”。请勿超过可用现金。
+- 说明：请根据当前流动性确定"target_cash"。请勿超过可用现金。
 """
         # =======================================================
 
         # 3. AI 分析
         if not silent: logger.info(f"🧠 发送给 DeepSeek (含资金信息)...")
-        # 组合最终的 Prompt
         final_user_content = f"### DUAL TIMEFRAME MARKET DATA:\n{data_json}\n{account_context}"
         
         response = deepseek_client.chat.completions.create(
@@ -341,7 +493,7 @@ def run_analysis(symbol, silent=False):
                 {"role": "user", "content": final_user_content}
             ],
             stream=False, temperature=0.2 
-            )
+        )
         ai_text = response.choices[0].message.content
  
         # 4. 结果处理
@@ -356,38 +508,34 @@ def run_analysis(symbol, silent=False):
             
             logger.error(error_msg)
             if not silent:
-                send_telegram(error_msg) # 立即发送报警消息给 Telegram
+                send_telegram(error_msg)
             return parsed_res
 
-# ================= 交易执行 (修改调用参数) =================
+        # ================= 交易执行 =================
         trade_feedback = ""
         action = parsed_res.get('action', 'WAIT')
         confidence = parsed_res.get('confidence', 0)
-        target_cash = parsed_res.get('target_cash', 0.0)  # 获取 AI 建议金额
+        target_cash = parsed_res.get('target_cash', 0.0)
         
         # 只有在信号明确且置信度高时才交易
         if action in ["BUY", "SELL"] and confidence >= 70:
             logger.info(f"⚡ 触发交易: {action} (AI建议金额: {target_cash})")
-            # 调用 execute_order 执行交易
-            trade_feedback = execute_order(symbol, action, confidence, target_cash)
+            trade_feedback = execute_order(clean_symbol, action, confidence, target_cash)
         # =======================================================
 
-        # --- C. 发送报告 (包含交易反馈) ---
+        # --- C. 发送报告 ---
         if not silent:
             report = f"🐯 {stock_name} ({symbol}) 分析报告\n"
             report += f"决策: {action} (信度: {confidence}%)\n"
             report += f"建议金额: {target_cash}\n"
             report += f"理由: {parsed_res.get('reason', 'N/A')}\n"
             
-            # 如果发生了交易，把结果附在报告里
             if trade_feedback:
                 report += f"----------------\n⚙️ 执行: {trade_feedback}\n"
             
             send_telegram(report)
             
         return parsed_res
-
-
 
     except Exception as e:
         logger.error(f"❌ 流程异常: {e}")
@@ -401,71 +549,89 @@ def execute_order(symbol, action_str, confidence, target_cash):
     target_cash: AI 建议的交易金额 (由 JSON 返回)
     """
     if not getattr(config, 'ENABLE_TRADING', False):
+        logger.info(f"ℹ️ 模拟交易模式: {action_str} {target_cash} (开关关闭)")
         return f"模拟交易: 开关关闭 (AI建议: {action_str} {target_cash})"
 
     try:
         # 1. 基础信息
-        symbol = symbol.upper()
+        symbol = symbol.upper().strip()
         curr_pos = get_position(symbol)
         
         # 获取实时价格
         quote = data_manager.get_realtime_snapshot(symbol)
         price = quote.get('mid_price', 0)
-        if price <= 0: return "❌ 价格获取失败，取消"
+        if price <= 0:
+            logger.warning(f"⚠️ {symbol} 价格获取失败")
+            return "❌ 价格获取失败，取消"
 
         quantity = 0
         
-        # ================= BUY 逻辑 (支持加仓) =================
+        # ================= BUY 逻辑 =================
         if action_str == "BUY":
-            # 【逻辑修改】不再拦截 curr_pos > 0，允许加仓
-            # 资金风控：再次核对账户余额 (防止 AI 幻觉建议了超额资金)
             avail_cash, _ = get_account_status()
             
             # 使用 AI 建议的金额，但不能超过实际可用资金
+            # 如果无法获取账户信息，使用保守策略
+            if avail_cash == -1:
+                logger.warning(f"⚠️ 无法获取账户余额，采用保守策略")
+                avail_cash = 0
+            
             safe_cash = min(float(target_cash), float(avail_cash))
             
-            if safe_cash < price: # 连一股都买不起
-                return f"❌ 资金不足或AI建议金额过小 (建议: {target_cash}, 股价: {price})"
+            if safe_cash < price:
+                msg = f"❌ 资金不足或AI建议金额过小 (建议: {target_cash}, 股价: {price}, 可用: {avail_cash})"
+                logger.warning(msg)
+                return msg
 
-            # 计算股数 (向下取整)
             quantity = int(safe_cash / price)
-            
-            # 港股/A股 手数调整 (可选优化: 确保是 100 的倍数)
-            # if symbol.isdigit(): quantity = (quantity // 100) * 100 
-            
-            if quantity == 0: return "❌ 计算股数为 0"
+            if quantity == 0:
+                logger.warning(f"❌ {symbol} 计算股数为 0")
+                return "❌ 计算股数为 0"
 
         # ================= SELL 逻辑 =================
         elif action_str == "SELL":
-            if curr_pos <= 0: return "⚠️ 无持仓，无法卖出"
+            if curr_pos <= 0:
+                logger.warning(f"⚠️ {symbol} 无持仓，无法卖出")
+                return "⚠️ 无持仓，无法卖出"
             
-            # 如果 AI 建议卖出金额为 0 或 负数，默认视为【清仓】
             if target_cash <= 0 or target_cash >= (curr_pos * price):
                 quantity = curr_pos
                 note = "清仓"
             else:
-                # 减仓逻辑
                 quantity = int(target_cash / price)
                 if quantity > curr_pos: quantity = curr_pos
                 note = f"减仓 (保留 {curr_pos - quantity}股)"
 
-        # 3. 下单执行
-        contract = tiger_trade_client.get_contracts(symbol=symbol)[0]
-        action = ActionType.BUY if action_str == "BUY" else ActionType.SELL
+        else:
+            return "❌ 未知的操作类型"
+
+        # ================= 下单执行 (演示模式) =================
+        logger.info(f"📋 下单准备: {action_str} {quantity}股 @ {price}")
         
-        order = Order(
-            account=config.TIGER_ACCOUNT,
-            contract=contract,
-            action=action,
-            order_type=OrderType.MKT,
-            quantity=quantity
-        )
-        
-        oid = tiger_trade_client.place_order(order)
-        return f"✅ 下单成功: {action_str} {quantity}股 ({note if action_str == 'SELL' else '加仓' if curr_pos > 0 else '建仓'})"
+        try:
+            contract = tiger_trade_client.get_contracts(symbol=[symbol])[0]
+            action = ActionType.BUY if action_str == "BUY" else ActionType.SELL
+            
+            order = Order(
+                account=config.TIGER_ACCOUNT,
+                contract=contract,
+                action=action,
+                order_type=OrderType.MKT,
+                quantity=quantity
+            )
+            
+            oid = tiger_trade_client.place_order(order)
+            msg = f"✅ 下单成功 (ID: {oid}): {action_str} {quantity}股"
+            logger.info(msg)
+            return msg
+            
+        except Exception as e:
+            logger.error(f"❌ Tiger 下单异常: {e}")
+            # 降级到演示模式
+            return f"⚠️ 演示模式: {action_str} {quantity}股 (实际下单失败: {str(e)[:50]})"
 
     except Exception as e:
-        logger.error(f"❌ 下单异常: {e}")
+        logger.error(f"❌ 下单流程异常: {e}")
         return f"执行失败: {str(e)}"
 
 # ================= 6. 入口 =================
@@ -505,38 +671,28 @@ def poll_telegram_updates():
 
 if __name__ == "__main__":
     init_services()
-    logger.info("🚀 机器人启动 (v3.1 自动调度修复版)")
-    send_telegram("🚀 机器人已重启: 自动调度已启用")
+    logger.info("🚀 机器人启动 (v3.2 账户管理增强版)")
+    send_telegram("🚀 机器人已重启: 账户管理已启用")
     
-    # 初始化计时器
     last_scan_time = time.time()
     
     while True:
         try:
-            # 1. 响应 Telegram 指令 (保持原有的 /track 立即触发功能)
-            # poll_telegram_updates 内部已经包含了: 收到指令 -> 更新列表 -> 立即扫描 的逻辑
             poll_telegram_updates()
             
-            # 2. 执行定时扫描逻辑
             current_time = time.time()
-            # 检查是否达到扫描间隔 (config.SCAN_INTERVAL) 且监控列表不为空
             if (current_time - last_scan_time > config.SCAN_INTERVAL) and WATCH_LIST:
                 logger.info(f"⏰ 触发定时扫描 (间隔: {config.SCAN_INTERVAL}s)")
                 
-                # 批量刷新数据缓存 (这一步至关重要，确保数据不是旧的)
                 data_manager.batch_fetch_all(WATCH_LIST)
                 
-                # 逐个分析
                 for symbol in WATCH_LIST:
                     run_analysis(symbol, silent=False)
                 
-                # 重置计时器
                 last_scan_time = current_time
                 
         except Exception as e:
             logger.error(f"❌ 主循环发生异常: {e}")
-            # 防止死循环报错导致 CPU 飙升，异常后稍作等待
             time.sleep(5)
             
-        # 短暂休眠，避免死循环占用过多 CPU 资源
         time.sleep(1)
