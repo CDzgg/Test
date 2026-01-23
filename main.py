@@ -141,19 +141,28 @@ system_prompt = """
 
 # ================= 3. 数据与缓存管理器 =================
 
+# ================= 替换整个 MarketDataManager 类 (终极兼容版：支持 DataFrame) =================
+import pandas as pd # 确保文件头部导入了 pandas，这里再次引用防错
+
 class MarketDataManager:
     def __init__(self, quote_client, ttl_seconds=60):
         self.client = quote_client
         self.ttl = ttl_seconds
-        # 结构: { 'symbol': { 'quote': {data, ts}, '5min': {data, ts}, '240min': {data, ts} } }
         self._cache = {}
 
     def _get_from_cache(self, symbol, data_type):
-        """检查缓存是否命中且有效"""
+        # 1. 直接查找
         if symbol in self._cache and data_type in self._cache[symbol]:
             item = self._cache[symbol][data_type]
             if time.time() - item['ts'] < self.ttl:
                 return item['data']
+        # 2. 模糊查找 (匹配 .SH/.HK 前缀)
+        if data_type == 'quote': 
+            for key in self._cache.keys():
+                if key.split('.')[0] == symbol:
+                    item = self._cache[key][data_type]
+                    if time.time() - item['ts'] < self.ttl:
+                        return item['data']
         return None
 
     def _update_cache(self, symbol, data_type, data):
@@ -165,22 +174,47 @@ class MarketDataManager:
         }
 
     def batch_fetch_all(self, symbol_list):
-        """批量获取数据 (核心优化)"""
         if not symbol_list: return
-
         unique_symbols = list(set([s.upper().strip() for s in symbol_list]))
-        logger.info(f"🔄 正在批量刷新数据 ({len(unique_symbols)} 支股票)...")
+        logger.info(f"🔄 正在批量刷新数据: {unique_symbols}")
 
-        # 1. 批量 Quote
         try:
+            # 1. 获取数据
             briefs = self.client.get_stock_briefs(symbols=unique_symbols)
-            for item in briefs:
-                sym = getattr(item, 'symbol', None) or getattr(item, 'identifier', None)
-                if sym: self._update_cache(sym, 'quote', item)
-        except Exception as e:
-            logger.error(f"❌ 批量行情失败: {e}")
+            
+            # ================= 🌟 关键修复点 🌟 =================
+            # 检查是否为 pandas DataFrame，如果是，转为字典列表
+            if isinstance(briefs, pd.DataFrame):
+                logger.info(f"   ↳ 检测到 DataFrame 格式，正在转换...")
+                # 将 DataFrame 转为 [{'symbol': '...', 'latest_price': ...}, ...]
+                briefs = briefs.to_dict('records')
+            # ====================================================
 
-        # 2. 批量 K线 (5m & 4h)
+            logger.info(f"   ↳ 最终处理 {len(briefs)} 条行情数据")
+            
+            for item in briefs:
+                # 兼容性解析
+                raw_sym = None
+                if isinstance(item, dict):
+                    raw_sym = item.get('symbol') or item.get('identifier')
+                else:
+                    raw_sym = getattr(item, 'symbol', None) or getattr(item, 'identifier', None)
+
+                if not raw_sym:
+                    continue
+
+                # 存入缓存
+                self._update_cache(raw_sym, 'quote', item)
+                
+                # 双向绑定
+                clean_sym = raw_sym.split('.')[0]
+                if clean_sym != raw_sym:
+                     self._update_cache(clean_sym, 'quote', item)
+
+        except Exception as e:
+            logger.error(f"❌ 批量行情获取失败: {e}")
+
+        # 2. 批量 K线 (保持不变)
         for period in ['5min', '240min']:
             try:
                 bars_df = self.client.get_bars(
@@ -192,18 +226,20 @@ class MarketDataManager:
                 if bars_df is not None and not bars_df.empty:
                     grouped = bars_df.groupby('symbol')
                     for sym, group in grouped:
-                        # ⚠️ 关键: 确保按时间正序排列 (旧->新)
+                        clean_sym = sym.split('.')[0]
                         df_clean = group.copy().sort_values('time')
                         df_clean.rename(columns={
                             'time': 'Datetime', 'open': 'Open', 'high': 'High',
                             'low': 'Low', 'close': 'Close', 'volume': 'Volume'
                         }, inplace=True)
                         self._update_cache(sym, period, df_clean)
+                        if clean_sym != sym:
+                            self._update_cache(clean_sym, period, df_clean)
             except Exception as e:
                 logger.error(f"❌ 批量 {period} K线失败: {e}")
 
     def get_realtime_snapshot(self, symbol):
-        """获取实时快照 (Mid-price & OI)"""
+        # 1. 获取缓存
         cached = self._get_from_cache(symbol, 'quote')
         if not cached:
             try:
@@ -211,24 +247,36 @@ class MarketDataManager:
                 cached = self._get_from_cache(symbol, 'quote')
             except: pass
         
+        # 2. 提取数据
+        mid = 0.0
+        oi = 0
+        
         if cached:
-            bid = getattr(cached, 'bid_price', 0)
-            ask = getattr(cached, 'ask_price', 0)
-            latest = getattr(cached, 'latest_price', 0)
-            mid = latest
-            if bid and ask and bid > 0 and ask > 0:
-                mid = (bid + ask) / 2
-            return {'mid_price': mid, 'open_interest': getattr(cached, 'open_int', None)}
-        return {}
+            def get_val(obj, key):
+                if isinstance(obj, dict):
+                    return obj.get(key)
+                return getattr(obj, key, None)
 
-    def get_bars(self, symbol, period):
-        """获取 K 线"""
-        cached = self._get_from_cache(symbol, period)
-        if cached is not None: return cached
-        try:
-            self.batch_fetch_all([symbol])
-            return self._get_from_cache(symbol, period)
-        except: return None
+            # 价格提取逻辑 (最新价 > 买卖中价 > 昨收价)
+            latest = get_val(cached, 'latest_price')
+            bid = get_val(cached, 'bid_price') or 0
+            ask = get_val(cached, 'ask_price') or 0
+            pre_close = get_val(cached, 'pre_close') or 0
+
+            if latest and latest > 0:
+                mid = latest
+            elif bid > 0 and ask > 0:
+                mid = (bid + ask) / 2
+            elif pre_close > 0:
+                mid = pre_close
+                logger.info(f"ℹ️ {symbol} 休市/无成交，使用昨收价: {mid}")
+            
+            oi = get_val(cached, 'open_int') or 0
+
+        if mid == 0:
+            logger.warning(f"❌ {symbol} 价格依然为 0 (Raw: {cached})")
+        
+        return {'mid_price': mid, 'open_interest': oi}
 
 # ================= 4. 辅助函数 =================
 
@@ -328,14 +376,24 @@ def get_account_status():
         # 尝试使用 get_asset 或类似方法获取资产信息
         # Tiger API 通常通过账户查询获取资金信息
         try:
-            # 方法1: 尝试 get_asset (常见的资产查询方法)
-            asset = tiger_trade_client.get_asset()
-            if asset:
-                cash_available = getattr(asset, 'cash', 0)
+            # 方法1: 尝试 get_assets (修正为复数形式)
+            assets = tiger_trade_client.get_assets() # <--- 修改点1: 改为复数调用
+            if assets and isinstance(assets, list):
+                # <--- 修改点2: 返回的是列表，通常取第一个账户
+                asset = assets[0] 
+                
+                # <--- 修改点3: 增加字段兼容性处理 (不同账户类型字段可能不同)
+                # 优先取 'available_funds' (可用资金)，其次取 'cash' (现金余额)
+                cash_available = getattr(asset, 'available_funds', None)
+                if cash_available is None:
+                    cash_available = getattr(asset, 'cash', 0)
+                
                 currency = getattr(asset, 'currency', 'HKD')
                 logger.info(f"💰 账户资金: {cash_available} {currency}")
                 return (float(cash_available), currency)
         except AttributeError:
+            # 如果 get_assets 也不存在或属性错误，记录日志并进入下方的方法2
+            logger.warning("⚠️ get_assets调用失败或属性缺失，尝试方法2...")
             pass
         
         try:
