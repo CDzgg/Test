@@ -278,6 +278,22 @@ class MarketDataManager:
         
         return {'mid_price': mid, 'open_interest': oi}
 
+    def get_bars(self, symbol, period):
+        """
+        获取 K 线数据 (这是之前漏掉的方法)
+        """
+        # 1. 尝试从缓存获取
+        cached = self._get_from_cache(symbol, period)
+        if cached is not None: 
+            return cached
+            
+        # 2. 如果缓存没有，尝试触发一次批量刷新
+        try:
+            self.batch_fetch_all([symbol])
+            return self._get_from_cache(symbol, period)
+        except: 
+            return None
+
 # ================= 4. 辅助函数 =================
 
 def _get_private_key_path():
